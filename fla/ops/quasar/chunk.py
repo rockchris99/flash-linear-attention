@@ -45,9 +45,9 @@ def chunk_quasar_fwd(
     # Pad if T is not a multiple of BT
     if T % BT != 0:
         pad_len = BT - (T % BT)
-        q = F.pad(q, (0, 0, 0, pad_len))
-        k = F.pad(k, (0, 0, 0, pad_len))
-        v = F.pad(v, (0, 0, 0, pad_len))
+        q = torch.cat([q, q.new_zeros((B, pad_len, H, S))], dim=1)
+        k = torch.cat([k, k.new_zeros((B, pad_len, H, S))], dim=1)
+        v = torch.cat([v, v.new_zeros((B, pad_len, H, S))], dim=1)
         T = T + pad_len
         NT = triton.cdiv(T, BT)
     
