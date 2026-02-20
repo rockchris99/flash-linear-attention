@@ -440,35 +440,26 @@ def chunk_quasar_fwd(
     eps = 1e-8
     alpha = (1 - torch.exp(-beta.view(-1, 1, 1, 1) * k_norm_sq)) / (k_norm_sq + eps)  # [B, H, NT, BT, 1]
 
-    # Reshape for fused kernel: [B*H*NT, BT, S] and [B*H*NT, BT, 1]
-    k_flat = k_chunks.view(B * H * NT, BT, S)
-    alpha_flat = alpha.view(B * H * NT, BT, 1)
-
-    # Fused Triton kernel for KK^T with alpha and tril
-    # M = tril(alpha * K @ K^T, diagonal=-1)
-    M_flat = fused_kkt_alpha_tril(k_flat, alpha_flat)
-    M = M_flat.view(B, H, NT, BT, BT)
+    # Compute M = tril(alpha * K @ K^T, diagonal=-1) using torch ops
+    KKt = torch.matmul(k_chunks, k_chunks.transpose(-2, -1))  # [B, H, NT, BT, BT]
+    M = torch.tril(alpha * KKt, diagonal=-1)  # [B, H, NT, BT, BT]
 
     # Compute L = I + M
-    L = M + torch.eye(BT, device=q.device, dtype=q.dtype)
+    I_eye_bt = torch.eye(BT, device=q.device, dtype=q.dtype)
+    L = M + I_eye_bt
 
     # Compute A = L^(-1) by solving L @ A = I
     I_eye = torch.eye(BT, device=q.device, dtype=torch.float32)
     L_f32 = L.to(torch.float32)
     A = torch.linalg.solve_triangular(L_f32, I_eye, upper=False).to(q.dtype)  # [B, H, NT, BT, BT]
 
-    # Compute W = A @ (alpha * K) and U = A @ (alpha * V) with separate matmuls
+    # Compute W = A @ (alpha * K) and U = A @ (alpha * V)
     alpha_expanded = alpha.expand(-1, -1, -1, -1, S)  # [B, H, NT, BT, S]
+    alpha_k = (alpha_expanded * k_chunks).contiguous()  # [B, H, NT, BT, S]
+    alpha_v = (alpha_expanded * v_chunks).contiguous()  # [B, H, NT, BT, S]
 
-    A_flat = A.view(B * H * NT, BT, BT)
-    alpha_k_flat = (alpha_expanded * k_chunks).view(B * H * NT, BT, S)
-    alpha_v_flat = (alpha_expanded * v_chunks).view(B * H * NT, BT, S)
-
-    W_flat = triton_batched_matmul(A_flat, alpha_k_flat)  # separate W matmul
-    U_flat = triton_batched_matmul(A_flat, alpha_v_flat)  # separate U matmul
-
-    W = W_flat.view(B, H, NT, BT, S)
-    U = U_flat.view(B, H, NT, BT, S)
+    W = torch.matmul(A, alpha_k)   # [B, H, NT, BT, S]
+    U = torch.matmul(A, alpha_v)   # [B, H, NT, BT, S]
 
     # Pre-compute K transpose for ALL chunks
     k_chunks_t = k_chunks.transpose(-2, -1).contiguous()  # [B, H, NT, S, BT]
@@ -504,18 +495,28 @@ def chunk_quasar_fwd(
     # Get all states: [B*H*NT, S, S] -> [B, H, NT, S, S]
     state_all = h_buf.view(B * H, NT, S, S).view(B, H, NT, S, S).contiguous()
 
-    # Batched output computation
     A_trans_5d = A_trans_all.view(B, H, NT, S, S).contiguous()
     KtU_5d = KtU_f32.view(B, H, NT, S, S).contiguous()
 
-    # Step 1: A_trans @ state per chunk  [B, H, NT, S, S] @ [B, H, NT, S, S]
-    A_state = torch.matmul(A_trans_5d.float(), state_all.float())  # [B, H, NT, S, S]
-    # Step 2: q @ (A_trans @ state) for inter-chunk
-    o_inter = torch.matmul(q_chunks.float(), A_state)              # [B, H, NT, BT, S]
-    # Step 3: q @ KtU for intra-chunk
-    o_intra = torch.matmul(q_chunks.float(), KtU_5d.float())      # [B, H, NT, BT, S]
-    # Step 4: combine
-    o_chunks = (o_inter + o_intra).to(q.dtype)
+    # Mini-batched output computation (process chunks in groups)
+    CHUNK_BATCH = 256
+    o_parts = []
+    for start in range(0, NT, CHUNK_BATCH):
+        end = min(start + CHUNK_BATCH, NT)
+
+        q_b = q_chunks[:, :, start:end].float()
+        a_b = A_trans_5d[:, :, start:end].float()
+        s_b = state_all[:, :, start:end].float()
+        k_b = KtU_5d[:, :, start:end].float()
+
+        # A_trans @ state
+        a_state = torch.matmul(a_b, s_b)
+        # q @ (A_trans @ state) + q @ KtU
+        o_inter = torch.matmul(q_b, a_state)
+        o_intra = torch.matmul(q_b, k_b)
+        o_parts.append((o_inter + o_intra).to(q.dtype))
+
+    o_chunks = torch.cat(o_parts, dim=2)
 
     # Permute and reshape: [B, H, NT, BT, S] -> [B, NT, BT, H, S] -> [B, T, H, S]
     o = o_chunks.permute(0, 2, 3, 1, 4).contiguous().view(B, NT * BT, H, S)
@@ -544,7 +545,7 @@ class ChunkQuasarFunction(torch.autograd.Function):
         cu_seqlens: torch.Tensor | None = None,
         **kwargs,
     ):
-        chunk_size = 128
+        chunk_size = 256
         chunk_indices = prepare_chunk_indices(
             cu_seqlens, chunk_size) if cu_seqlens is not None else None
 
