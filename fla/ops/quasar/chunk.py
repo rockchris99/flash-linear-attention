@@ -502,42 +502,23 @@ def chunk_quasar_fwd(
     final_state = final_state_raw.view(B, H, S, S) if output_final_state else None
 
     # Get all states: [B*H*NT, S, S] -> [B, H, NT, S, S]
-    state_all = h_buf.view(B * H, NT, S, S).view(B, H, NT, S, S)
+    state_all = h_buf.view(B * H, NT, S, S).view(B, H, NT, S, S).contiguous()
 
-    # Per-chunk output computation (sequential loop)
-    o = torch.empty_like(q)
-    I_full = torch.eye(S, device=q.device, dtype=torch.float32).unsqueeze(0).unsqueeze(0)  # [1, 1, S, S]
+    # Batched output computation
+    A_trans_5d = A_trans_all.view(B, H, NT, S, S).contiguous()
+    KtU_5d = KtU_f32.view(B, H, NT, S, S).contiguous()
 
-    for i in range(NT):
-        # Get pre-computed values for this chunk
-        state_i = state_all[:, :, i].to(torch.float32)  # [B, H, S, S]
-        KtW_c = KtW_all[:, :, i].to(torch.float32)      # [B, H, S, S]
-        KtU_c = KtU_all[:, :, i].to(torch.float32)      # [B, H, S, S]
+    # Step 1: A_trans @ state per chunk  [B, H, NT, S, S] @ [B, H, NT, S, S]
+    A_state = torch.matmul(A_trans_5d.float(), state_all.float())  # [B, H, NT, S, S]
+    # Step 2: q @ (A_trans @ state) for inter-chunk
+    o_inter = torch.matmul(q_chunks.float(), A_state)              # [B, H, NT, BT, S]
+    # Step 3: q @ KtU for intra-chunk
+    o_intra = torch.matmul(q_chunks.float(), KtU_5d.float())      # [B, H, NT, BT, S]
+    # Step 4: combine
+    o_chunks = (o_inter + o_intra).to(q.dtype)
 
-        # A_trans = I - KtW
-        A_trans_c = I_full - KtW_c  # [B, H, S, S]
-
-        # Compute effective state for output
-        q_c = q_chunks[:, :, i]  # [B, H, BT, S]
-        q_c_f32 = q_c.to(torch.float32)
-
-        # o_inter = q @ state (inter-chunk)
-        o_inter = torch.matmul(q_c_f32, state_i)  # [B, H, BT, S]
-
-        # Intra-chunk: q @ K^T @ (U - W @ state)
-        W_c = W[:, :, i].to(torch.float32)  # [B, H, BT, S]
-        U_c = U[:, :, i].to(torch.float32)  # [B, H, BT, S]
-        k_c_t = k_chunks_t[:, :, i].to(torch.float32)  # [B, H, S, BT]
-
-        WS = torch.matmul(W_c, state_i)   # [B, H, BT, S]
-        diff = U_c - WS                    # [B, H, BT, S]
-        Kt_diff = torch.matmul(k_c_t, diff)  # [B, H, S, S]
-        o_intra = torch.matmul(q_c_f32, Kt_diff)  # [B, H, BT, S]
-
-        o_c = (o_inter + o_intra).to(q.dtype)  # [B, H, BT, S]
-
-        # Store output: [B, H, BT, S] -> [B, BT, H, S]
-        o[:, i * BT:(i + 1) * BT] = o_c.transpose(1, 2)
+    # Permute and reshape: [B, H, NT, BT, S] -> [B, NT, BT, H, S] -> [B, T, H, S]
+    o = o_chunks.permute(0, 2, 3, 1, 4).contiguous().view(B, NT * BT, H, S)
 
     final_state = state_all[:, :, -1].view(B, H, S, S) if output_final_state else None
 
@@ -563,7 +544,7 @@ class ChunkQuasarFunction(torch.autograd.Function):
         cu_seqlens: torch.Tensor | None = None,
         **kwargs,
     ):
-        chunk_size = 256  # Larger chunks = fewer loop iterations, better for A100
+        chunk_size = 128
         chunk_indices = prepare_chunk_indices(
             cu_seqlens, chunk_size) if cu_seqlens is not None else None
 
